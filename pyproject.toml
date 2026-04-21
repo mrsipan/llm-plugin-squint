@@ -1,0 +1,32 @@
+[project]
+name = "llm_tools_squint"
+version = "0.4"
+description = "JavaScript execution as a tool for LLM"
+readme = "README.md"
+authors = [{name = "Simon Willison"}]
+license = "Apache-2.0"
+classifiers = []
+requires-python = ">=3.9"
+dependencies = [
+    "llm>=0.26",
+    "quickjs"
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["llm_tools_squint"]
+
+[project.urls]
+Homepage = "https://github.com/simonw/llm-tools-squint"
+Changelog = "https://github.com/simonw/llm-tools-squint/releases"
+Issues = "https://github.com/simonw/llm-tools-squint/issues"
+CI = "https://github.com/simonw/llm-tools-squint/actions"
+
+[project.entry-points.llm]
+llm_tools_squint = "llm_tools_squint"
+
+[project.optional-dependencies]
+test = ["pytest", "llm-echo>=0.3a1"]
