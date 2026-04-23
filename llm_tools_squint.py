@@ -1,160 +1,194 @@
 import os
 import queue
 import re
-import subprocess
-import tempfile
 import threading
 from typing import Optional
 
 import llm
 from quickjs import Context
 
-# --- THE GC BLACK HOLE ---
-_leak_queue = queue.Queue()
+# ── GC WORKAROUND ────────────────────────────────────────────────────────────
+# The quickjs Python binding can segfault if a Context is garbage-collected
+# while the interpreter is still alive. We keep all Contexts alive for the
+# process lifetime by draining them into this immortal list on a daemon thread.
+_immortal_refs: list = []
+_pin_queue: queue.Queue = queue.Queue()
 
 
-def _black_hole_worker():
-    immortal_contexts = []
+def _pin_worker():
     while True:
-        immortal_contexts.append(_leak_queue.get())
+        _immortal_refs.append(_pin_queue.get())
 
 
-threading.Thread(target=_black_hole_worker, daemon=True).start()
+threading.Thread(
+    target=_pin_worker, daemon=True, name="quickjs-gc-pin"
+    ).start()
+
+
+def _pin(ctx: Context) -> Context:
+    """Register a Context so it is never garbage-collected."""
+    _pin_queue.put(ctx)
+    return ctx
+
+
+# ── MODULE-LEVEL SINGLETONS ───────────────────────────────────────────────────
+# One context for compilation, one for execution. Both survive across all calls.
+
+_compiler_ctx: Optional[Context] = None  # runs compiler.js → emits JS
+_runtime_ctx: Optional[Context] = None  # runs the compiled JS
+
+
+def _get_compiler_ctx() -> Context:
+    """
+    Load compiler.js into a dedicated Context and expose a Python-callable
+    compile function.  compiler.js must be a plain-script / IIFE / UMD build —
+    the Python quickjs bindings do not support ES-module syntax.
+    If your build is ESM-only, bundle it with esbuild --format=iife first:
+        esbuild compiler.js --bundle --format=iife \
+            --global-name=SquintCompiler --outfile=compiler_iife.js
+    """
+    global _compiler_ctx
+    if _compiler_ctx is not None:
+        return _compiler_ctx
+
+    compiler_path = os.environ.get("SQUINT_JS_PATH", "compiler_iife.js")
+    ctx = Context()
+    ctx.set_time_limit(10.0)
+    ctx.set_memory_limit(64 * 1024 * 1024)
+
+    try:
+        with open(compiler_path) as f:
+            src = f.read()
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Squint compiler not found at '{compiler_path}'. "
+            "Set SQUINT_JS_PATH or build compiler.js first."
+            )
+
+    ctx.eval(src)
+
+    # Probe for the compile function under the names squint typically exports
+    ctx.eval(
+        """
+        var __compileString = (
+            (typeof SquintCompiler !== 'undefined' && SquintCompiler.compileString)
+            || (typeof compileString !== 'undefined' && compileString)
+            || (typeof squint_core !== 'undefined' && squint_core.compileString)
+        );
+        if (!__compileString) throw new Error(
+            "compileString not found — is compiler.js an IIFE/UMD build?"
+        );
+    """
+        )
+
+    _compiler_ctx = _pin(ctx)
+    return _compiler_ctx
+
+
+def _get_runtime_ctx() -> Context:
+    global _runtime_ctx
+    if _runtime_ctx is not None:
+        return _runtime_ctx
+
+    bundle_path = os.environ.get(
+        "SQUINT_BUNDLE_PATH", "squint_bundle.js"
+        )
+    ctx = Context()
+    ctx.set_time_limit(5.0)
+    ctx.set_memory_limit(32 * 1024 * 1024)
+
+    try:
+        with open(bundle_path) as f:
+            ctx.eval(f.read())
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Standard library bundle not found at '{bundle_path}'. "
+            "Build it first."
+            )
+
+    _runtime_ctx = _pin(ctx)
+    return _runtime_ctx
+
+
+# ── IMPORT REWRITING ─────────────────────────────────────────────────────────
+
+# Each pattern is explicit — no DOTALL, so we never silently eat too much.
+_IMPORT_PATTERNS = [
+    # import * as foo from 'squint-cljs/bar.js'  →  var foo = globalThis.squint_lib.bar;
+    (
+        re.compile(
+            r"^import\s+\*\s+as\s+([\w$]+)\s+from\s+['\"]squint-cljs/([\w$-]+?)(?:\.m?js)?['\"];?\s*$",
+            re.MULTILINE,
+            ),
+        r"var \1 = globalThis.squint_lib.\2;",
+        ),
+    # import { a, b } from 'squint-cljs/bar.js'  →  var { a, b } = globalThis.squint_lib.bar;
+    (
+        re.compile(
+            r"^import\s+\{([^}]+)\}\s+from\s+['\"]squint-cljs/([\w$-]+?)(?:\.m?js)?['\"];?\s*$",
+            re.MULTILINE,
+            ),
+        r"var {\1} = globalThis.squint_lib.\2;",
+        ),
+    # strip remaining imports/exports
+    (re.compile(r"^import\b[^\n]*;?\s*$", re.MULTILINE), ""),
+    (re.compile(r"^export\b[^\n]*;?\s*$", re.MULTILINE), ""),
+    ]
+
+
+def _rewrite_imports(js: str) -> str:
+    for pattern, replacement in _IMPORT_PATTERNS:
+        js = pattern.sub(replacement, js)
+    return js
+
+
+# ── CORE LOGIC ───────────────────────────────────────────────────────────────
+
+
+def _compile(clojure_script: str) -> str:
+    ctx = _get_compiler_ctx()
+    # Pass source via a JS variable to avoid any template-literal escaping issues
+    ctx.eval(f"var __src = {repr(clojure_script)};")
+    compiled_js = ctx.eval("__compileString(__src)")
+    return _rewrite_imports(str(compiled_js))
+
+
+def _execute(compiled_js: str) -> str:
+    ctx = _get_runtime_ctx()
+    result = ctx.eval(compiled_js)
+    if hasattr(result, "json"):
+        return result.json()
+    return str(result) if result is not None else ""
+
+
+# ── LLM TOOLBOX ──────────────────────────────────────────────────────────────
 
 
 class SquintJS(llm.Toolbox):
-    _context: Optional[Context] = None
-
-    def _get_context(self) -> Context:
-        if not self._context:
-            self._context = Context()
-            self._context.set_time_limit(1.0)
-            self._context.set_memory_limit(16 * 1024 * 1024)
-
-            # Instantly load the pre-bundled standard library
-            bundle_path = os.environ.get(
-                "SQUINT_BUNDLE_PATH", "squint_bundle.js"
-                )
-            try:
-                with open(bundle_path, "r") as f:
-                    self._context.eval(f.read())
-            except FileNotFoundError:
-                raise RuntimeError(
-                    f"Standard library bundle not found at {bundle_path}. Please build it first."
-                    )
-
-            _leak_queue.put(self._context)
-
-        return self._context
-
-    def _compile_with_host(self, clojure_script: str) -> str:
-        """Compile CLJS to JS using the standalone QuickJS binary (qjs)."""
-        squint_path = os.environ.get("SQUINT_JS_PATH", "compiler.js")
-        squint_abs_path = os.path.abspath(squint_path)
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".cljs", mode="w", delete=False
-            ) as cljs_file:
-            cljs_file.write(clojure_script)
-            cljs_path = cljs_file.name
-
-        bridge_js = f"""
-        import * as std from 'std';
-        import * as squint from '{squint_abs_path}';
-
-        const cljsCode = std.loadFile(scriptArgs[1]);
-
-        if (!cljsCode) {{
-            console.error("Failed to read CLJS file.");
-            std.exit(1);
-        }}
-
-        try {{
-            const compileFn = squint.compileString || squint.default?.compileString || squint.squint_core?.compileString;
-            const jsCode = compileFn(cljsCode);
-            std.printf("%s", jsCode);
-        }} catch (e) {{
-            console.error(e.toString());
-            std.exit(1);
-        }}
-        """
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".js", mode="w", delete=False
-            ) as bridge_file:
-            bridge_file.write(bridge_js)
-            bridge_path = bridge_file.name
-
-        try:
-            result = subprocess.run(
-                ["qjs", "-m", bridge_path, cljs_path],
-                capture_output=True,
-                text=True,
-                check=True
-                )
-
-            compiled_js = result.stdout
-
-            # --- INTERCEPT IMPORTS & MAP TO THE PRE-BUNDLED GLOBALS ---
-
-            # 1. Map namespace imports (e.g., import * as html from 'squint-cljs/html.js')
-            compiled_js = re.sub(
-                r"import\s+\*\s+as\s+([\w_]+)\s+from\s+['\"]squint-cljs/([\w_-]+)(?:\.js|\.mjs)?['\"];?",
-                r"const \1 = globalThis.squint_lib.\2;", compiled_js
-                )
-
-            # 2. Map named imports (e.g., import { join } from 'squint-cljs/string.js')
-            compiled_js = re.sub(
-                r"import\s+\{([^}]+)\}\s+from\s+['\"]squint-cljs/([\w_-]+)(?:\.js|\.mjs)?['\"];?",
-                r"const {\1} = globalThis.squint_lib.\2;", compiled_js
-                )
-
-            # 3. Strip remaining ES module syntax to prevent QuickJS SyntaxErrors
-            compiled_js = re.sub(
-                r'import\s+.*?;', '', compiled_js, flags=re.DOTALL
-                )
-            compiled_js = re.sub(
-                r'export\s+.*?;', '', compiled_js, flags=re.DOTALL
-                )
-
-            return compiled_js
-
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"QuickJS Compilation failed:\n{e.stderr}"
-                )
-        finally:
-            if os.path.exists(cljs_path):
-                os.remove(cljs_path)
-            if os.path.exists(bridge_path):
-                os.remove(bridge_path)
-
     def execute_squint(self, clojure_script: str) -> str:
         """
-        Compile and execute Squint code.
-        The full standard library is available (clojure.string, clojure.set, math, etc.).
+        Compile and execute Squint ClojureScript.
+        The full standard library is available (clojure.string, clojure.set, math, …).
         """
-        context = self._get_context()
         try:
-            compiled_js = self._compile_with_host(clojure_script)
-            result = context.eval(compiled_js)
-
-            if hasattr(result, "json"):
-                return result.json()
-            return str(result) if result is not None else ""
-
+            compiled_js = _compile(clojure_script)
+            return _execute(compiled_js)
         except RuntimeError as e:
-            return f"Compilation Error: {str(e)}"
+            return f"Compilation Error: {e}"
         except Exception as e:
-            return f"Execution Error: {str(e)}"
+            return f"Execution Error: {e}"
 
-    def reset_context(self):
-        self._context = None
+    def reset_context(self) -> str:
+        """Drop both contexts so they are recreated fresh on the next call."""
+        global _compiler_ctx, _runtime_ctx
+        _compiler_ctx = None
+        _runtime_ctx = None
+        return "Contexts reset."
 
 
 def squint_eval(clojure_script: str) -> str:
-    toolbox = SquintJS()
-    return toolbox.execute_squint(clojure_script)
+    """Compile and run a Squint ClojureScript expression."""
+    return SquintJS().execute_squint(clojure_script)
 
 
 @llm.hookimpl
