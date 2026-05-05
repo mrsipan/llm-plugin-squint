@@ -19,6 +19,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = ["llm_tools_squint"]
 
+[tool.setuptools.package-data]
+js_files = ["js/*.js"]
+
 [project.urls]
 Homepage = "https://github.com/simonw/llm-tools-squint"
 Changelog = "https://github.com/simonw/llm-tools-squint/releases"

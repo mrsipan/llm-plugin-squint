@@ -51,14 +51,24 @@ def _get_compiler_ctx() -> Context:
     if _compiler_ctx is not None:
         return _compiler_ctx
 
-    compiler_path = os.environ.get("SQUINT_JS_PATH", "compiler_iife.js")
     ctx = Context()
     ctx.set_time_limit(10.0)
     ctx.set_memory_limit(64 * 1024 * 1024)
 
+    js_path = os.environ.get("SQUINT_JS_PATH")
+    if js_path is not None:
+        with open(js_path, 'r', encoding='utf-8') as fp:
+            js_code = fp.read()
+
+    else:
+        with importlib.resources.files("llm_tools_squint.js").joinpath(
+            "compiler_iife.js"
+            ).open("r", encoding="utf-8") as fp:
+            js_code = fp.read()
+
     try:
-        with open(compiler_path) as f:
-            src = f.read()
+        with open(js_code) as fp:
+            src = fp.read()
     except FileNotFoundError:
         raise RuntimeError(
             f"Squint compiler not found at '{compiler_path}'. "
@@ -90,16 +100,23 @@ def _get_runtime_ctx() -> Context:
     if _runtime_ctx is not None:
         return _runtime_ctx
 
-    bundle_path = os.environ.get(
-        "SQUINT_BUNDLE_PATH", "squint_bundle.js"
-        )
     ctx = Context()
     ctx.set_time_limit(5.0)
     ctx.set_memory_limit(32 * 1024 * 1024)
 
+    bundle_path = os.environ.get("SQUINT_BUNDLE_PATH")
+    if bundle_path is not None:
+        with open(bundle_path, 'r', encoding='utf-8') as fp:
+            bundle_path = fp.read()
+    else:
+        with importlib.resources.files("llm_tools_squint.js").joinpath(
+            "squint_bundle.js"
+            ).open("r", encoding="utf-8") as fp:
+            bundle_path = fp.read()
+
     try:
-        with open(bundle_path) as f:
-            ctx.eval(f.read())
+        with open(bundle_path) as fp:
+            ctx.eval(fp.read())
     except FileNotFoundError:
         raise RuntimeError(
             f"Standard library bundle not found at '{bundle_path}'. "
@@ -158,7 +175,8 @@ def _execute(compiled_js: str) -> str:
     result = ctx.eval(compiled_js)
     if hasattr(result, "json"):
         return result.json()
-    return str(result) if result is not None else ""
+    # Add whitespace after stdout/stderr and 'nil' on None
+    return '\n' + str(result) if result is not None else "\nnil"
 
 
 # ── LLM TOOLBOX ──────────────────────────────────────────────────────────────
