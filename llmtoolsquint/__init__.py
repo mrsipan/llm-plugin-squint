@@ -1,3 +1,4 @@
+import importlib
 import os
 import queue
 import re
@@ -5,7 +6,7 @@ import threading
 from typing import Optional
 
 import llm
-from quickjs import Context
+from quickjs_std import Context
 
 # ── GC WORKAROUND ────────────────────────────────────────────────────────────
 # The quickjs Python binding can segfault if a Context is garbage-collected
@@ -61,21 +62,23 @@ def _get_compiler_ctx() -> Context:
             js_code = fp.read()
 
     else:
-        with importlib.resources.files("llm_tools_squint.js").joinpath(
+        with importlib.resources.files("llmtoolsquint.js").joinpath(
             "compiler_iife.js"
             ).open("r", encoding="utf-8") as fp:
+
             js_code = fp.read()
+            print(js_code)
 
-    try:
-        with open(js_code) as fp:
-            src = fp.read()
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"Squint compiler not found at '{compiler_path}'. "
-            "Set SQUINT_JS_PATH or build compiler.js first."
-            )
+    # try:
+    #     with open(js_code) as fp:
+    #         src = fp.read()
+    # except FileNotFoundError:
+    #     raise RuntimeError(
+    #         f"Squint compiler not found at '{compiler_path}'. "
+    #         "Set SQUINT_JS_PATH or build compiler.js first."
+    #         )
 
-    ctx.eval(src)
+    ctx.eval(js_code)
 
     # Probe for the compile function under the names squint typically exports
     ctx.eval(
@@ -107,21 +110,22 @@ def _get_runtime_ctx() -> Context:
     bundle_path = os.environ.get("SQUINT_BUNDLE_PATH")
     if bundle_path is not None:
         with open(bundle_path, 'r', encoding='utf-8') as fp:
-            bundle_path = fp.read()
+            bundle = fp.read()
     else:
-        with importlib.resources.files("llm_tools_squint.js").joinpath(
+        with importlib.resources.files("llmtoolsquint.js").joinpath(
             "squint_bundle.js"
             ).open("r", encoding="utf-8") as fp:
-            bundle_path = fp.read()
+            bundle = fp.read()
 
-    try:
-        with open(bundle_path) as fp:
-            ctx.eval(fp.read())
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"Standard library bundle not found at '{bundle_path}'. "
-            "Build it first."
-            )
+    ctx.eval(bundle)
+    # try:
+    #     with open(bundle_path) as fp:
+    #         ctx.eval(fp.read())
+    # except FileNotFoundError:
+    #     raise RuntimeError(
+    #         f"Standard library bundle not found at '{bundle_path}'. "
+    #         "Build it first."
+    #         )
 
     _runtime_ctx = _pin(ctx)
     return _runtime_ctx

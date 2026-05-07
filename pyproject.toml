@@ -1,5 +1,5 @@
 [project]
-name = "llm_tools_squint"
+name = "llmtoolsquint"
 version = "0.4"
 description = "JavaScript execution as a tool for LLM"
 readme = "README.md"
@@ -16,11 +16,11 @@ dependencies = [
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-py-modules = ["llm_tools_squint"]
+[tool.setuptools.packages.find]
+where = ["."]
 
 [tool.setuptools.package-data]
-js_files = ["js/*.js"]
+js_files = ["llmtoolsquint/js/*.js"]
 
 [project.urls]
 Homepage = "https://github.com/simonw/llm-tools-squint"
@@ -29,7 +29,7 @@ Issues = "https://github.com/simonw/llm-tools-squint/issues"
 CI = "https://github.com/simonw/llm-tools-squint/actions"
 
 [project.entry-points.llm]
-llm_tools_squint = "llm_tools_squint"
+llmtoolsquint = "llmtoolsquint"
 
 [project.optional-dependencies]
 test = ["pytest", "llm-echo>=0.3a1"]
